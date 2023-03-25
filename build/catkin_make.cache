@@ -1,0 +1,2 @@
+motion_controller:rmd_motor_controller_frontRight:rmd_motor_controller_frontleft:rmd_motor_controller_rearLeft:rmd_motor_controller_rearRight:test
+-DCATKIN_DEVEL_PREFIX=/home/bjersgen2004/car_ws/devel -DCMAKE_INSTALL_PREFIX=/home/bjersgen2004/car_ws/install -G Unix Makefiles

@@ -1,0 +1,8 @@
+prefix=/home/bjersgen2004/car_ws/devel
+
+Name: rmd_motor_controller_frontRight
+Description: Description of rmd_motor_controller_frontRight
+Version: 0.0.0
+Cflags: 
+Libs: -L${prefix}/lib 
+Requires: roscpp rospy std_msgs

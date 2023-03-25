@@ -1,0 +1,229 @@
+#!/usr/bin/env python
+# YOLOv5 🚀 by Ultralytics, GPL-3.0 license
+import rospy
+from std_msgs.msg import String
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+import cv2
+from numpy import random
+import numpy as np
+import torch
+import torch.backends.cudnn as cudnn
+import pyrealsense2 as rs	#导入realsense的sdk模块
+import datetime
+
+# 设置路径
+FILE = Path(__file__).resolve()
+ROOT = FILE.parents[0]
+if str(ROOT) not in sys.path:
+    sys.path.append(str(ROOT))
+ROOT = Path(os.path.relpath(ROOT, Path.cwd()))
+
+from models.experimental import attempt_load
+from utils.general import check_img_size, check_requirements,  \
+    non_max_suppression, print_args, scale_coords, set_logging
+from utils.plots import Annotator, colors
+from utils.torch_utils import select_device, time_sync
+from utils.datasets import letterbox
+
+# 深度信息检测不到会报警，忽略
+import warnings
+warnings.filterwarnings('ignore')
+
+@torch.no_grad()
+def run(weights=ROOT / 'yolov5s.pt',  # model.pt path
+        imgsz=640,                    # inference size, 640×480
+        conf_thres=0.4,               # confidence threshold
+        iou_thres=0.5,                # NMS IOU threshold
+        max_det=1000,                 # maximum detections per image
+        device='',                    # cuda device
+        classes=None,                 # filter by class: --class 0, or --class 0 2 3
+        agnostic_nms=False,           # class-agnostic NMS
+        augment=False,                # augmented inference
+        line_thickness=3,             # bounding box thickness
+        ):
+    
+    # 消息发布初始化
+    pub = rospy.Publisher('chatter', String, queue_size=10)
+    rospy.init_node('talker', anonymous=True)
+    # rate = rospy.Rate(0.2) # 0.2hz
+
+    # 初始化
+    set_logging()      # 日志初始化
+    device = select_device(device)
+    t_soundsum = 0     # 用于记录消息发布间隔时间
+    t_set = 5          # 间隔时间设置
+    dis_thres = 0.6    # 输出物体的最远距离
+    flag = 0           # 记录首次消息发布
+    publish_strs = []  # 记录所有发布的消息
+    
+    # Load model
+    w = str(weights[0] if isinstance(weights, list) else weights)
+    stride, names = 64, [f'class{i}' for i in range(1000)]  # assign defaults
+    
+    model = torch.jit.load(w) if 'torchscript' in w else attempt_load(weights, map_location=device)
+    stride = int(model.stride.max())  # model stride
+    names = model.module.names if hasattr(model, 'module') else model.names  # get class names
+        
+    imgsz = check_img_size(imgsz, s=stride)  # check image size
+    
+    # 实例化realsense模块
+    pipeline = rs.pipeline()
+    # 创建config对象
+    config = rs.config()
+    # 声明RGB和深度视频流
+    config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+    config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+
+    # 启动数据流
+    pipeline.start(config)
+    align_to_color = rs.align(rs.stream.color)  # 对齐rgb和深度图
+    
+    # 循环检测，is_shutdown()检查程序是否应该退出
+    while not rospy.is_shutdown():
+        t1 = time_sync()
+        obj_list = []  # 用于保存每一帧中满足条件的检测信息以供选择
+        
+        # 等待最新的影像：深度和颜色合成的连贯的帧
+        frames = pipeline.wait_for_frames()
+        frames = align_to_color.process(frames)  # 对齐
+        
+        # 将合成帧分开
+        depth_frame = frames.get_depth_frame()
+        color_frame = frames.get_color_frame()
+        
+        # 转换成numpy
+        color_image = np.asanyarray(color_frame.get_data())
+
+        # 对RGB的img进行处理，送入预测模型；path：图片/视频路径，img:Padded resize后的图片，im0s:原图
+        imgs = [None]
+        imgs[0] = color_image
+        im0s = imgs.copy()
+        img = [letterbox(x, new_shape=imgsz)[0] for x in im0s]
+        img = np.stack(img, 0)
+        img = img[:, :, :, ::-1].transpose(0, 3, 1, 2)     # BGR to RGB
+        img = np.ascontiguousarray(img, dtype=np.float32)  # uint8 to float32
+        
+        img = torch.from_numpy(img).to(device)
+        img = img / 255.0    # 0 - 255 to 0.0 - 1.0
+        if len(img.shape) == 3:
+            img = img[None]  # 维度扩展
+     
+        # 预测
+        pred = model(img, augment=augment)[0]
+
+        # NMS
+        pred = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
+        
+        # 打印及保存检测信息
+        for i, det in enumerate(pred):
+            im0 = im0s[i].copy()
+
+            annotator = Annotator(im0, line_width=line_thickness, example=str(names))  # 用于添加注释
+            if len(det):
+                # Rescale boxes from img_size to im0 size
+                # 参数：resize后图片大小，边框大小，原图大小
+                det[:, :4] = scale_coords(img.shape[2:], det[:, :4], im0.shape).round()
+
+                # 画预测框，坐标(0, 0)在左上角
+                for *xyxy, conf, cls in reversed(det):
+                                    
+                    # 获取距离
+                    distance_list = []  
+                    mid_pos = [int((int(xyxy[0]) + int(xyxy[2])) / 2), int((int(xyxy[1]) + int(xyxy[3])) / 2)]  # 预测框的中心点位置
+                    min_val = min(abs(int(xyxy[2]) - int(xyxy[0])), abs(int(xyxy[3]) - int(xyxy[1])))           # 预测框较小边的长度
+                    # 对40+1个随机点进行深度值获取
+                    randnum = 40
+                    dist = depth_frame.get_distance(int(mid_pos[0]), int(mid_pos[1])) # 保证获取了中心点的深度值
+                    if dist:
+                        distance_list.append(dist)  # 添加到列表
+                    for _ in range(randnum):
+                        bias = random.randint(-min_val // 5, min_val // 5)  # 生成随机偏差，范围为±预测框较小边长度的1/5
+                        dist = depth_frame.get_distance(int(mid_pos[0] + bias), int(mid_pos[1] + bias)) # 获取距中心点偏差处的深度值
+                        if dist:
+                            distance_list.append(dist)
+                    # 对深度信息进行排序取出中间值
+                    distance_list = np.array(distance_list)
+                    distance_list = np.sort(distance_list)[randnum // 2 - randnum // 4:randnum // 2 + randnum // 4]
+                    # 取平均值为目标深度
+                    distance = '%.2f%s' % (np.mean(distance_list), 'm')
+                    
+                    # 显示标签、置信值和深度值
+                    c = int(cls)  # 预测类别
+                    label = f'{names[c]} {conf:.2f} {distance}'
+                    # 把注释画到边框上
+                    annotator.box_label(xyxy, label, color=colors(c, True))
+                    
+                    # 筛选满足避让条件的物体
+                    if 160 < mid_pos[1] < 480 and np.mean(distance_list) < dis_thres:
+                        obj_list.append([names[c], round(np.mean(distance_list), 3)])
+                    
+            # 显示包含检测结果的影像
+            im0 = annotator.result()     
+            cv2.imshow('detection', im0)
+            cv2.waitKey(1)
+        
+        t_soundsum += time_sync() - t1
+        # 每隔一定时间输出前方最近的物体，首次消息发布无需满足时间要求
+        if len(obj_list) != 0 and (t_soundsum > t_set or flag == 0):
+            flag = 1
+            obj_list = sorted(obj_list, key=lambda x:x[1])
+            obj_choose = obj_list[0]
+            t_soundsum = 0
+            # publish_str = f"{obj_choose[0]} is detected, and the distance is {obj_choose[1]}m"
+            publish_str = f"{obj_choose[0]}"
+            rospy.loginfo(publish_str)
+            pub.publish(publish_str)
+            # rate.sleep()
+            
+            publish_strs.append(publish_str)
+
+    # 将通信结果写入文件
+    with open('runs/conversation/results.txt', 'a+') as f:
+        current_time = datetime.datetime.now()
+        f.write(str(current_time) + '\n')
+        f.write('\n'.join(publish_strs))
+        f.write('\n\n')
+    print("Results saved to runs/conversation/results.txt")
+
+
+def parse_opt():
+    parser = argparse.ArgumentParser()
+    # 模型路径
+    parser.add_argument('--weights', nargs='+', type=str, default=ROOT / 'yolov5s.pt', help='model path(s)')
+    parser.add_argument('--imgsz', '--img', '--img-size', nargs='+', type=int, default=[640], help='inference size h,w')
+    parser.add_argument('--conf-thres', type=float, default=0.4, help='confidence threshold')
+    parser.add_argument('--iou-thres', type=float, default=0.5, help='NMS IoU threshold')
+    
+    parser.add_argument('--max-det', type=int, default=1000, help='maximum detections per image')
+    parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
+    parser.add_argument('--classes', nargs='+', type=int, help='filter by class: --classes 0, or --classes 0 2 3')
+    parser.add_argument('--agnostic-nms', action='store_true', help='class-agnostic NMS')
+    parser.add_argument('--augment', action='store_true', help='augmented inference')
+    
+    # 画线边框厚度
+    parser.add_argument('--line-thickness', default=3, type=int, help='bounding box thickness (pixels)')
+    opt = parser.parse_args()
+    opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # expand
+    print_args(FILE.stem, opt)
+    return opt
+
+
+def main(opt):
+    # check_requirements对python版本和requirements.txt安装的包进行版本检测
+    # run()函数则是执行目标检测的主函数
+    check_requirements(exclude=('tensorboard', 'thop'))
+    run(**vars(opt))
+
+
+if __name__ == "__main__":
+    opt = parse_opt()
+    try:
+        main(opt)
+    except rospy.ROSInterruptException:
+        pass
+
